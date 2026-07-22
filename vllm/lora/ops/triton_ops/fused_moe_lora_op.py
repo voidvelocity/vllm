@@ -1036,23 +1036,32 @@ def _fused_moe_lora_kernel_npu(
 
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
 
-    # --- Inline: c_ptrs (sort_c=False path) ---
+    # --- Inline: c_ptrs (sort_c=False path, 1D for NPU compatibility) ---
+    # The Ascend ttir_to_linalg pass crashes on ``tl.store`` with 2D pointer
+    # tensors + 2D masks (PointerUnion assertion). The working
+    # ``_fused_moe_lora_small_batch_kernel`` uses 1D pointers + 1D masks,
+    # which the Ascend compiler handles fine.
+    #
+    # In naive_block_assignment mode, ``offs_token[0] = pid_m`` and all
+    # other lanes are sentinel (num_valid_tokens), so token_mask is
+    # [True, False, False, ...].  Only row 0 of the accumulator holds real
+    # data; rows 1..BLOCK_SIZE_M-1 are zeroed (their a-loads are masked
+    # out).  We therefore store only row 0 using 1D pointers + 1D mask,
+    # matching the pattern proven in ``_fused_moe_lora_small_batch_kernel``.
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (
-        cur_c_ptr
-        + stride_cm * safe_offs_token[:, None]
-        + stride_cn * offs_cn[None, :]
-    )
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    n_mask = offs_cn < N
+    out_row_ptr = cur_c_ptr + safe_offs_token[0] * stride_cm
+    c_ptrs = out_row_ptr + offs_cn * stride_cn
+    out_row = accumulator[0, :]  # extract row 0 → 1D tensor
 
     # NPU: always use simple store (SPLIT_K is forced to 1 by the wrapper).
     # The ``if SPLIT_K == 1: ... else: tl.atomic_add`` pattern was removed
     # because the Ascend ttir_to_linalg pass crashes on the dead-code
     # ``tl.atomic_add`` branch even when SPLIT_K is a constexpr 1.
     if ADD_INPUTS:
-        prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
-        accumulator = accumulator + prev
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+        prev = tl.load(c_ptrs, mask=n_mask, other=0.0)
+        out_row = out_row + prev
+    tl.store(c_ptrs, out_row, mask=n_mask)
 
 
 @triton.jit(
