@@ -13,6 +13,11 @@ with PyTorch reference implementations:
   3. ``fused_moe_lora_expand`` — the expand-only op (rank → lora_b → output)
 
 fp8 variants are intentionally excluded.
+
+NOTE: All tests use the *naive* dispatch path (``sorted_token_ids=None``)
+to avoid depending on the ``moe_lora_align_block_size`` C++ op, which is not
+registered on NPU. The naive path is natively supported by all three
+kernels via the ``naive_block_assignment`` flag.
 """
 
 import random
@@ -21,7 +26,6 @@ from threading import Lock
 import pytest
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.lora.ops.triton_ops import (
     fused_moe_lora,
     fused_moe_lora_expand,
@@ -67,14 +71,6 @@ _dict_lock = Lock()
 # ---------------------------------------------------------------------------
 # Small helpers (mirroring test_fused_moe_lora_kernel.py)
 # ---------------------------------------------------------------------------
-def round_up(x, base):
-    return ((x + base - 1) // base) * base
-
-
-def CEILDIV(x, y):
-    return (x + y - 1) // y
-
-
 def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
     """Split ``num_tokens`` into ``num_sequences`` sequences; each sequence
     gets a single random LoRA id applied to all its tokens."""
@@ -118,45 +114,18 @@ def sample_data(num_tokens, num_sequences, max_loras, num_experts, top_k_num):
     return topk_ids, topk_weights, token_lora_mapping, active_lora_ids
 
 
-def _build_sorted_meta(topk_ids, token_lora_mapping, max_loras, num_experts, block_size, lora_ids):
-    """Run moe_lora_align_block_size and return the sorted metadata needed
-    by all three fused_moe_lora operators."""
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-    max_num_m_blocks = CEILDIV(max_num_tokens_padded, block_size)
+def _build_naive_meta(max_loras):
+    """Build metadata for the naive dispatch path (sorted_token_ids=None).
 
-    sorted_token_ids = torch.empty(
-        (max_loras * max_num_tokens_padded,), dtype=torch.int32
-    )
-    expert_ids = torch.empty((max_loras * max_num_m_blocks,), dtype=torch.int32)
-    num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
+    In naive mode the kernel uses ``expert_ids = topk_ids.reshape(-1)`` and
+    does not require the ``moe_lora_align_block_size`` C++ op.
+    """
     adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32)
-
-    ops.moe_lora_align_block_size(
-        topk_ids,
-        token_lora_mapping,
-        num_experts,
-        block_size,
-        max_loras,
-        max_num_tokens_padded,
-        max_num_m_blocks,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        adapter_enabled,
-        lora_ids,
-    )
-
-    expert_ids = expert_ids.view(max_loras, -1)
-    sorted_token_ids = sorted_token_ids.view(max_loras, -1)
+    # In naive mode grid_lora_dim is always 1 regardless of num_active_loras,
+    # but we keep max_loras+1 for consistency with the kernel's adapter_enabled
+    # lookup (index max_loras is the "no-lora" slot).
     num_active_loras = torch.tensor([max_loras + 1], dtype=torch.int32, device="cpu")
-    return (
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        adapter_enabled,
-        num_active_loras,
-    )
+    return adapter_enabled, num_active_loras
 
 
 # ---------------------------------------------------------------------------
@@ -256,18 +225,17 @@ def use_torch_expand(a_intermediate_cache1, token_lora_mapping, topk_ids,
 
 
 # ---------------------------------------------------------------------------
-# Kernel call wrappers
+# Kernel call wrappers (naive path)
 # ---------------------------------------------------------------------------
 def call_fused_moe_lora(
     topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
     lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, output,
-    max_loras, num_experts, block_size, add_inputs=True,
+    max_loras, block_size, add_inputs=True,
 ):
-    """Call the full ``fused_moe_lora`` op (shrink + expand fused)."""
-    (sorted_token_ids, expert_ids, num_tokens_post_padded, adapter_enabled,
-     num_active_loras) = _build_sorted_meta(
-        topk_ids, token_lora_mapping, max_loras, num_experts, block_size, lora_ids
-    )
+    """Call the full ``fused_moe_lora`` op via the naive dispatch path."""
+    adapter_enabled, num_active_loras = _build_naive_meta(max_loras)
+    # naive path: expert_ids is the flattened topk_ids
+    expert_ids = topk_ids.reshape(-1)
 
     with _dict_lock:
         _LORA_PTR_DICT.clear()
@@ -277,9 +245,9 @@ def call_fused_moe_lora(
             lora_a_stacked,
             lora_b_stacked,
             topk_weights,
-            sorted_token_ids,
+            None,  # sorted_token_ids — naive path
             expert_ids,
-            num_tokens_post_padded,
+            None,  # num_tokens_post_padded — naive path
             token_lora_mapping,
             max_lora_rank,
             top_k_num,
@@ -310,20 +278,20 @@ def call_fused_moe_lora(
 def call_fused_moe_lora_shrink(
     topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
     lora_ids, lora_a_stacked, hidden_states, a_intermediate_cache1,
-    max_loras, num_experts, num_slices, block_size,
+    max_loras, num_slices, block_size,
 ):
-    """Call the ``fused_moe_lora_shrink`` op (shrink only)."""
-    (sorted_token_ids, expert_ids, num_tokens_post_padded, adapter_enabled,
-     num_active_loras) = _build_sorted_meta(
-        topk_ids, token_lora_mapping, max_loras, num_experts, block_size, lora_ids
-    )
+    """Call the ``fused_moe_lora_shrink`` op via the naive dispatch path."""
+    adapter_enabled, num_active_loras = _build_naive_meta(max_loras)
+    expert_ids = topk_ids.reshape(-1)
 
     device = hidden_states.device
-    M = topk_weights.shape[0]
-    K = hidden_states.shape[1]
-    N = max_lora_rank
-    num_tokens = M * top_k_num
-    EM = sorted_token_ids.shape[1]
+    M = topk_weights.shape[0]          # num_tokens
+    K = hidden_states.shape[1]         # hidden_size
+    N = max_lora_rank                  # shrink output dim
+    # In naive mode EM = num_tokens_internal * block_size_m, where
+    # num_tokens_internal = M * top_k_num (matches _fused_moe_lora).
+    num_tokens_internal = M * top_k_num
+    EM = num_tokens_internal * block_size
 
     with _dict_lock:
         _LORA_PTR_DICT.clear()
@@ -332,9 +300,9 @@ def call_fused_moe_lora_shrink(
             hidden_states,
             lora_a_stacked,
             topk_weights,
-            sorted_token_ids,
+            None,  # sorted_token_ids — naive path
             expert_ids,
-            num_tokens_post_padded,
+            None,  # num_tokens_post_padded — naive path
             token_lora_mapping,
             top_k_num,
             lora_ids,
@@ -344,8 +312,8 @@ def call_fused_moe_lora_shrink(
             M,
             EM,
             K,
-            num_tokens,
-            num_experts,
+            num_tokens_internal,
+            lora_a_stacked[0].shape[1],  # num_experts
             num_slices,
             SHRINK_CONFIG["BLOCK_SIZE_M"],
             SHRINK_CONFIG["BLOCK_SIZE_N"],
@@ -362,20 +330,17 @@ def call_fused_moe_lora_shrink(
 def call_fused_moe_lora_expand(
     topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
     lora_ids, lora_b_stacked, a_intermediate_cache1, output,
-    max_loras, num_experts, num_slices, N, block_size,
+    max_loras, num_slices, N_per_slice, block_size,
 ):
-    """Call the ``fused_moe_lora_expand`` op (expand only)."""
-    (sorted_token_ids, expert_ids, num_tokens_post_padded, adapter_enabled,
-     num_active_loras) = _build_sorted_meta(
-        topk_ids, token_lora_mapping, max_loras, num_experts, block_size, lora_ids
-    )
+    """Call the ``fused_moe_lora_expand`` op via the naive dispatch path."""
+    adapter_enabled, num_active_loras = _build_naive_meta(max_loras)
+    expert_ids = topk_ids.reshape(-1)
 
     device = a_intermediate_cache1.device
-    M = topk_weights.shape[0]
-    K = max_lora_rank
-    num_tokens = M * top_k_num
-    EM = sorted_token_ids.shape[1]
-    w1_output_dim_size = N
+    M = topk_weights.shape[0]          # num_tokens
+    K = max_lora_rank                  # expand input dim (rank)
+    num_tokens_internal = M * top_k_num
+    EM = num_tokens_internal * block_size
 
     with _dict_lock:
         _LORA_PTR_DICT.clear()
@@ -384,23 +349,23 @@ def call_fused_moe_lora_expand(
             a_intermediate_cache1,
             lora_b_stacked,
             topk_weights,
-            sorted_token_ids,
+            None,  # sorted_token_ids — naive path
             expert_ids,
-            num_tokens_post_padded,
+            None,  # num_tokens_post_padded — naive path
             token_lora_mapping,
             top_k_num,
             lora_ids,
             adapter_enabled,
             device,
-            N,
+            N_per_slice,
             M,
             EM,
             K,
-            num_tokens,
-            num_experts,
+            num_tokens_internal,
+            lora_b_stacked[0].shape[1],  # num_experts
             num_slices,
             max_lora_rank,
-            w1_output_dim_size,
+            N_per_slice,  # w1_output_dim_size
             EXPAND_CONFIG["BLOCK_SIZE_M"],
             EXPAND_CONFIG["BLOCK_SIZE_N"],
             EXPAND_CONFIG["BLOCK_SIZE_K"],
@@ -440,7 +405,7 @@ def test_fused_moe_lora_full(
     num_tokens, top_k_num, num_experts, max_loras, N, K,
     max_lora_rank, block_size, num_slices, dtype, device, seed,
 ):
-    """Verify ``fused_moe_lora`` (full shrink+expand) on NPU."""
+    """Verify ``fused_moe_lora`` (full shrink+expand) on NPU via naive path."""
     torch.set_default_device(device)
     torch.accelerator.set_device_index(device)
     set_random_seed(seed)
@@ -464,7 +429,7 @@ def test_fused_moe_lora_full(
     call_fused_moe_lora(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, output,
-        max_loras, num_experts, block_size,
+        max_loras, block_size,
     )
 
     ref = use_torch_full(
@@ -500,7 +465,7 @@ def test_fused_moe_lora_full_single_token(device: str):
     call_fused_moe_lora(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, output,
-        max_loras, num_experts, block_size,
+        max_loras, block_size,
     )
     ref = use_torch_full(
         hidden_states, token_lora_mapping, topk_ids,
@@ -537,7 +502,7 @@ def test_fused_moe_lora_full_add_inputs(add_inputs: bool, device: str):
     call_fused_moe_lora(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, output,
-        max_loras, num_experts, block_size, add_inputs=add_inputs,
+        max_loras, block_size, add_inputs=add_inputs,
     )
     ref = use_torch_full(
         hidden_states, token_lora_mapping, topk_ids,
@@ -564,7 +529,7 @@ def test_fused_moe_lora_shrink(
     num_tokens, top_k_num, num_experts, max_loras, K,
     max_lora_rank, block_size, num_slices, dtype, device, seed,
 ):
-    """Verify ``fused_moe_lora_shrink`` on NPU.
+    """Verify ``fused_moe_lora_shrink`` on NPU via naive path.
 
     The shrink op computes: a_intermediate_cache1 = hidden @ lora_a.T
     Output shape: (num_slices, num_tokens, top_k_num, max_lora_rank)
@@ -590,7 +555,7 @@ def test_fused_moe_lora_shrink(
     call_fused_moe_lora_shrink(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, hidden_states, a_intermediate_cache1,
-        max_loras, num_experts, num_slices, block_size,
+        max_loras, num_slices, block_size,
     )
 
     ref = use_torch_shrink(
@@ -625,7 +590,7 @@ def test_fused_moe_lora_shrink_single_lora(device: str):
     call_fused_moe_lora_shrink(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, hidden_states, a_intermediate_cache1,
-        max_loras, num_experts, num_slices, block_size,
+        max_loras, num_slices, block_size,
     )
     ref = use_torch_shrink(
         hidden_states, token_lora_mapping, topk_ids,
@@ -652,10 +617,10 @@ def test_fused_moe_lora_expand(
     num_tokens, top_k_num, num_experts, max_loras, N,
     max_lora_rank, block_size, num_slices, dtype, device, seed,
 ):
-    """Verify ``fused_moe_lora_expand`` on NPU.
+    """Verify ``fused_moe_lora_expand`` on NPU via naive path.
 
     The expand op computes: output = a_intermediate_cache1 @ lora_b.T
-    We feed the *reference* shrink result as input so that only the expand
+    We feed a random intermediate cache as input so that only the expand
     kernel is under test.
     """
     torch.set_default_device(device)
@@ -667,8 +632,9 @@ def test_fused_moe_lora_expand(
         num_tokens, num_sequences, max_loras, num_experts, top_k_num
     )
 
+    N_per_slice = N // num_slices
     lora_b_stacked = [
-        torch.rand((max_loras, num_experts, N // num_slices, max_lora_rank), dtype=dtype)
+        torch.rand((max_loras, num_experts, N_per_slice, max_lora_rank), dtype=dtype)
         for _ in range(num_slices)
     ]
     # Build a random intermediate cache (same layout as the shrink output).
@@ -680,7 +646,7 @@ def test_fused_moe_lora_expand(
     call_fused_moe_lora_expand(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_b_stacked, a_intermediate_cache1, output,
-        max_loras, num_experts, num_slices, N, block_size,
+        max_loras, num_slices, N_per_slice, block_size,
     )
 
     ref = use_torch_expand(
@@ -715,7 +681,7 @@ def test_fused_moe_lora_expand_single_lora(device: str):
     call_fused_moe_lora_expand(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_b_stacked, a_intermediate_cache1, output,
-        max_loras, num_experts, num_slices, N, block_size,
+        max_loras, num_slices, N, block_size,
     )
     ref = use_torch_expand(
         a_intermediate_cache1, token_lora_mapping, topk_ids,
@@ -753,7 +719,7 @@ def test_fused_moe_lora_full_max_loras_boundary(device: str):
     call_fused_moe_lora(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, output,
-        max_loras, num_experts, block_size,
+        max_loras, block_size,
     )
     ref = use_torch_full(
         hidden_states, token_lora_mapping, topk_ids,
@@ -792,12 +758,12 @@ def test_fused_moe_lora_full_deterministic(device: str):
     call_fused_moe_lora(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, out1,
-        max_loras, num_experts, block_size,
+        max_loras, block_size,
     )
     call_fused_moe_lora(
         topk_ids, topk_weights, token_lora_mapping, max_lora_rank, top_k_num,
         lora_ids, lora_a_stacked, lora_b_stacked, hidden_states, out2,
-        max_loras, num_experts, block_size,
+        max_loras, block_size,
     )
     assert torch.equal(out1, out2), (
         "fused_moe_lora produced non-deterministic outputs on NPU"
