@@ -891,6 +891,156 @@ def _adjust_kernel_inputs(
     return grid_lora_dim, stride_tl, stride_el
 
 
+@triton.jit
+def _fused_moe_lora_kernel_npu(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    expert_ids_ptr,
+    token_lora_mapping_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    top_k_num,
+    # strides
+    stride_am,
+    stride_ak,
+    stride_bl,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    slice_a_size,
+    slice_c_size,
+    # Meta-parameters
+    num_slice_a: tl.constexpr,
+    num_slice_c: tl.constexpr,
+    token_mapping_factor: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    ADD_INPUTS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    max_loras: tl.constexpr,
+):
+    """Simplified fused MoE-LoRA kernel for NPU (naive_block_assignment only).
+
+    Key differences from ``_fused_moe_lora_kernel`` to avoid NPU Triton
+    compiler (ttir_to_linalg) crashes:
+
+    * No early ``return`` — uses a ``valid`` flag + ``if valid:`` block.
+    * No helper JIT functions — all pointer arithmetic is inlined.
+    * No ``do_not_specialize`` — lets Triton specialize all args.
+    * No TMA / GDC / sort_c / USE_B_L2_CACHE — CUDA-specific features removed.
+    * naive_block_assignment path only (sorted_token_ids is not supported).
+    """
+    pid = tl.program_id(axis=0)
+    slice_id = tl.program_id(axis=1)
+    lora_idx = tl.program_id(axis=2)
+
+    pid_sk = pid % SPLIT_K
+    pid_m_n = pid // SPLIT_K
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid_m_n // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
+    pid_n = (pid_m_n % num_pid_in_group) // group_size_m
+
+    # --- Inline: get lora_id (naive path only) ---
+    token_idx = pid_m // top_k_num
+    lora_id = tl.load(token_lora_mapping_ptr + token_idx)
+
+    # --- Single valid flag replaces all early returns ---
+    valid = (lora_id >= 0) & (lora_id < max_loras)
+
+    # --- Inline: get expert_id (naive path only) ---
+    expert_id = tl.load(expert_ids_ptr + pid_m)
+    valid = valid & (expert_id >= 0)
+
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+    # --- Inline: token offsets (naive path only) ---
+    offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+    token_mask = offs_token < num_valid_tokens
+
+    # --- Pointers (naive path, sort_c=False) ---
+    cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
+    cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
+    cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
+
+    a_ptrs = cur_a_ptr + (
+        offs_token[:, None] // token_mapping_factor * stride_am
+        + offs_k[None, :] * stride_ak
+    )
+
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
+    b_ptrs = (
+        cur_b_ptr
+        + lora_id * stride_bl
+        + expert_id * stride_be
+        + offs_k[:, None] * stride_bk
+        + offs_bn[None, :] * stride_bn
+    )
+
+    if valid:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
+        for k in range(0, grid_k):
+            cur_k_offset = k * (BLOCK_SIZE_K * SPLIT_K)
+            k_remaining = K - cur_k_offset
+
+            b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                other=0.0,
+            )
+            a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+
+            accumulator += tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
+
+        if MUL_ROUTED_WEIGHT:
+            moe_weight = tl.load(
+                topk_weights_ptr + offs_token, mask=token_mask, other=0.0
+            )
+            accumulator = accumulator * moe_weight[:, None]
+
+        accumulator = accumulator.to(c_ptr.dtype.element_ty)
+
+        # --- Inline: c_ptrs (sort_c=False path) ---
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = (
+            cur_c_ptr
+            + stride_cm * offs_token[:, None]
+            + stride_cn * offs_cn[None, :]
+        )
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+
+        if SPLIT_K == 1:
+            if ADD_INPUTS:
+                prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
+                tl.store(c_ptrs, prev + accumulator, mask=c_mask)
+            else:
+                tl.store(c_ptrs, accumulator, mask=c_mask)
+        else:
+            tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+
+
 @triton.jit(
     do_not_specialize=[
         "num_valid_tokens",
@@ -1226,6 +1376,53 @@ def _fused_moe_lora_shrink(
         grid_lora_dim,
     )
 
+    # NPU dispatch: the full ``_fused_moe_lora_kernel`` does not compile on
+    # the Triton Ascend backend (early returns + do_not_specialize + helper
+    # JIT functions trigger ttir_to_linalg aborts). Use the simplified
+    # ``_fused_moe_lora_kernel_npu`` which only supports naive_block_assignment.
+    if current_platform.device_type == "npu":
+        assert sorted_token_ids is None, (
+            "NPU fused_moe_lora_shrink only supports naive_block_assignment "
+            "(sorted_token_ids must be None)."
+        )
+        _fused_moe_lora_kernel_npu[grid](
+            qcurr_hidden_states,
+            b_ptr,
+            a_intermediate_cache1,
+            topk_weights,
+            expert_ids,
+            token_lora_mapping,
+            N,
+            K,
+            EM,
+            num_tokens,
+            top_k_num,
+            qcurr_hidden_states.stride(0),
+            qcurr_hidden_states.stride(1),
+            w1_lora_a_stacked.stride(0),
+            w1_lora_a_stacked.stride(1),
+            w1_lora_a_stacked.stride(3),
+            w1_lora_a_stacked.stride(2),
+            a_intermediate_cache1.stride(-2),
+            a_intermediate_cache1.stride(-1),
+            slice_a_size=qcurr_hidden_states.numel(),
+            slice_c_size=a_intermediate_cache1.numel() // num_slices,
+            num_slice_a=1,
+            num_slice_c=num_slices,
+            token_mapping_factor=1 if mul_routed_weight else top_k_num,
+            MUL_ROUTED_WEIGHT=False,
+            ADD_INPUTS=False,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            GROUP_SIZE_M=group_size_m,
+            SPLIT_K=split_k,
+            max_loras=lora_a_stacked[0].shape[0],
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return
+
     a_desc = None
     b_desc = None
     if use_tma and num_slices == 1:
@@ -1272,7 +1469,9 @@ def _fused_moe_lora_shrink(
         naive_block_assignment=sorted_token_ids is None,
         MUL_ROUTED_WEIGHT=False,
         ADD_INPUTS=False,
-        USE_B_L2_CACHE=True,
+        # .ca cache modifier is CUDA-specific; Ascend's triton backend
+        # crashes in ttir_to_linalg when it encounters this hint.
+        USE_B_L2_CACHE=current_platform.is_cuda(),
         sort_c=use_tma and sorted_token_ids is not None,
         IS_PRIMARY=True,
         **shrink_config,
@@ -1354,6 +1553,54 @@ def _fused_moe_lora_expand(
     # Fast path: directly accumulate into the corresponding slice interval of output.
     out_view = output[:, :, offset : offset + num_slices * N]
     slice_c_size = N * out_view.stride(2)
+
+    # NPU dispatch: the full ``_fused_moe_lora_kernel`` does not compile on
+    # the Triton Ascend backend (early returns + do_not_specialize + helper
+    # JIT functions trigger ttir_to_linalg aborts). Use the simplified
+    # ``_fused_moe_lora_kernel_npu`` which only supports naive_block_assignment.
+    if current_platform.device_type == "npu":
+        assert sorted_token_ids is None, (
+            "NPU fused_moe_lora_expand only supports naive_block_assignment "
+            "(sorted_token_ids must be None)."
+        )
+        _fused_moe_lora_kernel_npu[grid](
+            a_intermediate_cache1,
+            b_ptr,
+            out_view,
+            topk_weights,
+            expert_ids,
+            token_lora_mapping,
+            N,
+            K,
+            EM,
+            num_tokens,
+            top_k_num,
+            a_intermediate_cache1.stride(0),
+            a_intermediate_cache1.stride(1),
+            w1_lora_b_stacked.stride(0),
+            w1_lora_b_stacked.stride(1),
+            w1_lora_b_stacked.stride(3),
+            w1_lora_b_stacked.stride(2),
+            out_view.stride(1),
+            out_view.stride(2),
+            slice_a_size=a_intermediate_cache1.numel() // num_slices,
+            slice_c_size=slice_c_size,
+            num_slice_a=num_slices,
+            num_slice_c=num_slices,
+            token_mapping_factor=1,
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            ADD_INPUTS=True,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            GROUP_SIZE_M=group_size_m,
+            SPLIT_K=1,
+            max_loras=lora_b_stacked[0].shape[0],
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return
+
     a_desc = None
     b_desc = None
     if use_tma:
@@ -1408,7 +1655,9 @@ def _fused_moe_lora_expand(
         naive_block_assignment=sorted_token_ids is None,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         ADD_INPUTS=True,
-        USE_B_L2_CACHE=True,
+        # .ca cache modifier is CUDA-specific; Ascend's triton backend
+        # crashes in ttir_to_linalg when it encounters this hint.
+        USE_B_L2_CACHE=current_platform.is_cuda(),
         sort_c=False,
         IS_PRIMARY=False,
         **expand_config,
