@@ -1048,11 +1048,21 @@ def _fused_moe_lora_kernel_npu(
     # data; rows 1..BLOCK_SIZE_M-1 are zeroed (their a-loads are masked
     # out).  We therefore store only row 0 using 1D pointers + 1D mask,
     # matching the pattern proven in ``_fused_moe_lora_small_batch_kernel``.
+    #
+    # NOTE: ``safe_offs_token[0]`` cannot be used directly — Triton does not
+    # support indexing a 1D tensor with a constexpr scalar.  We use the
+    # scalar ``safe_pid_m`` instead, which equals ``offs_token[0]`` when the
+    # program is valid and 0 otherwise (matching the mask semantics).
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     n_mask = offs_cn < N
-    out_row_ptr = cur_c_ptr + safe_offs_token[0] * stride_cm
+    out_row_ptr = cur_c_ptr + safe_pid_m * stride_cm
     c_ptrs = out_row_ptr + offs_cn * stride_cn
-    out_row = accumulator[0, :]  # extract row 0 → 1D tensor
+    # Reduce accumulator (BLOCK_SIZE_M, BLOCK_SIZE_N) over the M axis to get
+    # a 1D output. In naive mode only row 0 is non-zero (rows 1..M-1 are
+    # masked to zero by ``token_mask`` during the A-load), so the sum equals
+    # row 0. This avoids ``accumulator[0, :]`` indexing which the Ascend
+    # Triton frontend rejects (``unsupported tensor index: constexpr[0]``).
+    out_row = tl.sum(accumulator, axis=0)
 
     # NPU: always use simple store (SPLIT_K is forced to 1 by the wrapper).
     # The ``if SPLIT_K == 1: ... else: tl.atomic_add`` pattern was removed
