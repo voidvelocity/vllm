@@ -934,7 +934,12 @@ def _fused_moe_lora_kernel_npu(
     Key differences from ``_fused_moe_lora_kernel`` to avoid NPU Triton
     compiler (ttir_to_linalg) crashes:
 
-    * No early ``return`` — uses a ``valid`` flag + ``if valid:`` block.
+    * No early ``return`` and no ``if valid:`` around the GEMM body — the
+      Ascend backend's ``scf.if`` lowering aborts on ``PointerUnion`` when
+      the conditional contains ``tl.dot``. Instead, invalid programs are
+      neutralised by clamping ``lora_id``/``expert_id`` to 0 and relying
+      on ``token_mask`` (all-False for out-of-range tokens) to zero every
+      store.
     * No helper JIT functions — all pointer arithmetic is inlined.
     * No ``do_not_specialize`` — lets Triton specialize all args.
     * No TMA / GDC / sort_c / USE_B_L2_CACHE — CUDA-specific features removed.
@@ -942,7 +947,6 @@ def _fused_moe_lora_kernel_npu(
     """
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
-    lora_idx = tl.program_id(axis=2)
 
     pid_sk = pid % SPLIT_K
     pid_m_n = pid // SPLIT_K
@@ -957,22 +961,29 @@ def _fused_moe_lora_kernel_npu(
     pid_n = (pid_m_n % num_pid_in_group) // group_size_m
 
     # --- Inline: get lora_id (naive path only) ---
-    token_idx = pid_m // top_k_num
+    # num_valid_tokens = num_tokens * top_k_num; clamp pid_m to avoid OOB
+    # loads from token_lora_mapping (size num_tokens) and expert_ids
+    # (size num_valid_tokens). Invalid programs are neutralised by
+    # token_mask (all-False) downstream.
+    safe_pid_m = tl.where(pid_m < num_valid_tokens, pid_m, 0)
+    token_idx = safe_pid_m // top_k_num
     lora_id = tl.load(token_lora_mapping_ptr + token_idx)
-
-    # --- Single valid flag replaces all early returns ---
-    valid = (lora_id >= 0) & (lora_id < max_loras)
+    # Clamp to [0, max_loras-1] so pointer arithmetic is always in-bounds.
+    lora_id = tl.where((lora_id >= 0) & (lora_id < max_loras), lora_id, 0)
 
     # --- Inline: get expert_id (naive path only) ---
-    expert_id = tl.load(expert_ids_ptr + pid_m)
-    valid = valid & (expert_id >= 0)
+    expert_id = tl.load(expert_ids_ptr + safe_pid_m)
+    expert_id = tl.where(expert_id >= 0, expert_id, 0)
 
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
     # --- Inline: token offsets (naive path only) ---
-    offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
-    token_mask = offs_token < num_valid_tokens
+    # Only offs[0] holds a valid token index; the rest are sentinel
+    # (num_valid_tokens) so token_mask zeroes them out.  Programs whose
+    # pid_m is out-of-range (>= num_valid_tokens) are also fully masked.
+    offs_token = tl.where(offs == 0, safe_pid_m, num_valid_tokens)
+    token_mask = (offs_token < num_valid_tokens) & (pid_m < num_valid_tokens)
 
     # --- Pointers (naive path, sort_c=False) ---
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
@@ -993,52 +1004,52 @@ def _fused_moe_lora_kernel_npu(
         + offs_bn[None, :] * stride_bn
     )
 
-    if valid:
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # --- GEMM body (unconditional, no scf.if) ---
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
-        for k in range(0, grid_k):
-            cur_k_offset = k * (BLOCK_SIZE_K * SPLIT_K)
-            k_remaining = K - cur_k_offset
+    grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
+    for k in range(0, grid_k):
+        cur_k_offset = k * (BLOCK_SIZE_K * SPLIT_K)
+        k_remaining = K - cur_k_offset
 
-            b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-            b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
 
-            a = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
-                other=0.0,
-            )
-            a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
-
-            accumulator += tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
-
-        if MUL_ROUTED_WEIGHT:
-            moe_weight = tl.load(
-                topk_weights_ptr + offs_token, mask=token_mask, other=0.0
-            )
-            accumulator = accumulator * moe_weight[:, None]
-
-        accumulator = accumulator.to(c_ptr.dtype.element_ty)
-
-        # --- Inline: c_ptrs (sort_c=False path) ---
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = (
-            cur_c_ptr
-            + stride_cm * offs_token[:, None]
-            + stride_cn * offs_cn[None, :]
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+            other=0.0,
         )
-        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
 
-        if SPLIT_K == 1:
-            if ADD_INPUTS:
-                prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
-                tl.store(c_ptrs, prev + accumulator, mask=c_mask)
-            else:
-                tl.store(c_ptrs, accumulator, mask=c_mask)
+        accumulator += tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(
+            topk_weights_ptr + offs_token, mask=token_mask, other=0.0
+        )
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(c_ptr.dtype.element_ty)
+
+    # --- Inline: c_ptrs (sort_c=False path) ---
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (
+        cur_c_ptr
+        + stride_cm * offs_token[:, None]
+        + stride_cn * offs_cn[None, :]
+    )
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+
+    if SPLIT_K == 1:
+        if ADD_INPUTS:
+            prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
+            tl.store(c_ptrs, prev + accumulator, mask=c_mask)
         else:
-            tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+            tl.store(c_ptrs, accumulator, mask=c_mask)
+    else:
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
 
 
 @triton.jit(
