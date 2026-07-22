@@ -981,9 +981,12 @@ def _fused_moe_lora_kernel_npu(
     # --- Inline: token offsets (naive path only) ---
     # Only offs[0] holds a valid token index; the rest are sentinel
     # (num_valid_tokens) so token_mask zeroes them out.  Programs whose
-    # pid_m is out-of-range (>= num_valid_tokens) are also fully masked.
-    offs_token = tl.where(offs == 0, safe_pid_m, num_valid_tokens)
-    token_mask = (offs_token < num_valid_tokens) & (pid_m < num_valid_tokens)
+    # pid_m is out-of-range (>= num_valid_tokens) are also fully masked
+    # because pid_m >= num_valid_tokens → token_mask[0] = False.
+    offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+    token_mask = offs_token < num_valid_tokens
+    # Clamp offsets for safe pointer arithmetic (mask handles correctness).
+    safe_offs_token = tl.where(token_mask, offs_token, 0)
 
     # --- Pointers (naive path, sort_c=False) ---
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
@@ -991,7 +994,7 @@ def _fused_moe_lora_kernel_npu(
     cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
 
     a_ptrs = cur_a_ptr + (
-        offs_token[:, None] // token_mapping_factor * stride_am
+        safe_offs_token[:, None] // token_mapping_factor * stride_am
         + offs_k[None, :] * stride_ak
     )
 
@@ -1027,7 +1030,7 @@ def _fused_moe_lora_kernel_npu(
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(
-            topk_weights_ptr + offs_token, mask=token_mask, other=0.0
+            topk_weights_ptr + safe_offs_token, mask=token_mask, other=0.0
         )
         accumulator = accumulator * moe_weight[:, None]
 
@@ -1037,19 +1040,19 @@ def _fused_moe_lora_kernel_npu(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = (
         cur_c_ptr
-        + stride_cm * offs_token[:, None]
+        + stride_cm * safe_offs_token[:, None]
         + stride_cn * offs_cn[None, :]
     )
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
 
-    if SPLIT_K == 1:
-        if ADD_INPUTS:
-            prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
-            tl.store(c_ptrs, prev + accumulator, mask=c_mask)
-        else:
-            tl.store(c_ptrs, accumulator, mask=c_mask)
-    else:
-        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+    # NPU: always use simple store (SPLIT_K is forced to 1 by the wrapper).
+    # The ``if SPLIT_K == 1: ... else: tl.atomic_add`` pattern was removed
+    # because the Ascend ttir_to_linalg pass crashes on the dead-code
+    # ``tl.atomic_add`` branch even when SPLIT_K is a constexpr 1.
+    if ADD_INPUTS:
+        prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
+        accumulator = accumulator + prev
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit(
@@ -1391,12 +1394,20 @@ def _fused_moe_lora_shrink(
     # the Triton Ascend backend (early returns + do_not_specialize + helper
     # JIT functions trigger ttir_to_linalg aborts). Use the simplified
     # ``_fused_moe_lora_kernel_npu`` which only supports naive_block_assignment.
+    # SPLIT_K is forced to 1 because the NPU kernel does not support
+    # ``tl.atomic_add`` (the Ascend compiler crashes on the dead-code branch).
     if current_platform.device_type == "npu":
         assert sorted_token_ids is None, (
             "NPU fused_moe_lora_shrink only supports naive_block_assignment "
             "(sorted_token_ids must be None)."
         )
-        _fused_moe_lora_kernel_npu[grid](
+        npu_grid = lambda META: (
+            triton.cdiv(EM, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            len(lora_a_stacked),
+            grid_lora_dim,
+        )
+        _fused_moe_lora_kernel_npu[npu_grid](
             qcurr_hidden_states,
             b_ptr,
             a_intermediate_cache1,
@@ -1427,7 +1438,7 @@ def _fused_moe_lora_shrink(
             BLOCK_SIZE_N=block_size_n,
             BLOCK_SIZE_K=block_size_k,
             GROUP_SIZE_M=group_size_m,
-            SPLIT_K=split_k,
+            SPLIT_K=1,
             max_loras=lora_a_stacked[0].shape[0],
             num_warps=num_warps,
             num_stages=num_stages,
