@@ -172,6 +172,7 @@ def _fused_moe_lora_kernel(
     num_tokens,
     num_experts,
     top_k_num,
+    max_loras,
     # ---- strides ----
     stride_am,
     stride_ak,
@@ -212,6 +213,12 @@ def _fused_moe_lora_kernel(
     For each (slice, lora_id, expert_id, token_block, n_block) work item,
     load the corresponding A tile and B tile, compute the GEMM, optionally
     multiply by topk weight and add to existing output.
+
+    NPU note: early ``return`` statements, ``lora_ids_ptr.numel()`` calls,
+    and the ``if SPLIT_K == 1: ... else: tl.atomic_add`` pattern all cause
+    the Ascend Triton backend (``ttir_to_linalg``) to crash. They have been
+    replaced by mask-based guarding, a ``max_loras`` runtime argument, and
+    a simple store respectively.
     """
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
@@ -236,44 +243,42 @@ def _fused_moe_lora_kernel(
         top_k_num,
         naive_block_assignment,
     )
-    if lora_id < 0:
-        return
-    if lora_id >= lora_ids_ptr.numel():
-        return
-    enabled = tl.load(adapter_enabled_ptr + lora_id)
-    if enabled == 0:
-        return
+    # NPU: no early return — clamp lora_id and guard with mask instead.
+    lora_valid = (lora_id >= 0) & (lora_id < max_loras)
+    safe_lora_id = tl.where(lora_valid, lora_id, 0)
+    enabled = tl.load(adapter_enabled_ptr + safe_lora_id)
+    lora_valid = lora_valid & (enabled != 0)
 
     if not naive_block_assignment:
-        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_id)
-        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-            return
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + safe_lora_id)
+        lora_valid = lora_valid & (pid_m * BLOCK_SIZE_M < num_tokens_post_padded)
 
     # Get expert_id.
     expert_id = _get_expert_id(
         expert_ids_ptr,
-        lora_id,
+        safe_lora_id,
         pid_m,
         stride_el,
-        lora_ids_ptr.numel(),
+        max_loras,
         naive_block_assignment,
     )
-    if expert_id == -1:
-        return
+    expert_valid = expert_id >= 0
+    safe_expert_id = tl.where(expert_valid, expert_id, 0)
+    valid = lora_valid & expert_valid
 
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = _get_token_offs(
         sorted_token_ids_ptr,
-        lora_id,
+        safe_lora_id,
         pid_m,
         offs,
         stride_tl,
-        lora_ids_ptr.numel(),
+        max_loras,
         num_tokens,
         naive_block_assignment,
         BLOCK_SIZE_M,
     )
-    token_mask = offs_token < num_tokens
+    token_mask = (offs_token < num_tokens) & valid
 
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
     cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
@@ -287,8 +292,8 @@ def _fused_moe_lora_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
     b_ptrs = (
         cur_b_ptr
-        + lora_id * stride_bl
-        + expert_id * stride_be
+        + safe_lora_id * stride_bl
+        + safe_expert_id * stride_be
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
@@ -321,7 +326,7 @@ def _fused_moe_lora_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = _get_c_ptrs(
         cur_c_ptr,
-        lora_id,
+        safe_lora_id,
         pid_m,
         offs,
         offs_token,
@@ -334,14 +339,13 @@ def _fused_moe_lora_kernel(
     )
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
 
-    if SPLIT_K == 1:
-        if ADD_INPUTS:
-            prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
-            tl.store(c_ptrs, prev + accumulator, mask=c_mask)
-        else:
-            tl.store(c_ptrs, accumulator, mask=c_mask)
-    else:
-        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+    # NPU: always use simple store — the ``if SPLIT_K == 1: ... else:
+    # tl.atomic_add`` pattern crashes Ascend's ttir_to_linalg on the
+    # dead-code ``tl.atomic_add`` branch even when SPLIT_K is constexpr 1.
+    if ADD_INPUTS:
+        prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
+        accumulator = accumulator + prev
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @torch.inference_mode()
@@ -418,6 +422,7 @@ def _fused_moe_lora_shrink(
         num_tokens,
         num_experts,
         top_k_num,
+        lora_a_stacked[0].shape[0],
         qcurr_hidden_states.stride(0),
         qcurr_hidden_states.stride(1),
         w1_lora_a_stacked.stride(0),
@@ -525,6 +530,7 @@ def _fused_moe_lora_expand(
         num_tokens,
         num_experts,
         top_k_num,
+        lora_b_stacked[0].shape[0],
         a_intermediate_cache1.stride(0),
         a_intermediate_cache1.stride(1),
         w1_lora_b_stacked.stride(0),
