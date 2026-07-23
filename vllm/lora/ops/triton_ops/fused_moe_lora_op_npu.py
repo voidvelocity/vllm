@@ -567,9 +567,11 @@ if __name__ == "__main__":
     )
 
     ref = torch.zeros(num_slices, M, tk, N, dtype=torch.float32)
+    lora_a_cpu = lora_a.cpu()
+    hidden_cpu = hidden.cpu()
     for i in range(M):
         for x in range(tk):
-            ref[0, i, x] = hidden[i].cpu() @ lora_a[0, 0].T
+            ref[0, i, x] = hidden_cpu[i] @ lora_a_cpu[0, 0].T
 
     err1 = (cache.cpu() - ref).abs().max().item()
     print(f"  fused_moe_lora_shrink_triton (single-expert) max_err={err1:.2e}")
@@ -608,9 +610,11 @@ if __name__ == "__main__":
     )
 
     ref2 = torch.zeros(num_slices2, M2, tk2, N2, dtype=torch.float32)
+    lora_a2_cpu = lora_a2.cpu()
+    hidden2_cpu = hidden2.cpu()
     for i in range(M2):
         eid = int(topk_ids2[i, 0].item())
-        ref2[0, i, 0] = hidden2[i].cpu() @ lora_a2[0, eid].T
+        ref2[0, i, 0] = hidden2_cpu[i] @ lora_a2_cpu[0, eid].T
 
     err2 = (cache2.cpu() - ref2).abs().max().item()
     print(f"  fused_moe_lora_shrink_triton (multi-expert) max_err={err2:.2e}")
