@@ -29,95 +29,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-@triton.jit
-def _get_lora_id(
-    lora_ids,
-    token_lora_mapping_ptr,
-    lora_idx,
-    pid_m,
-    top_k_num,
-    naive_block_assignment: tl.constexpr,
-):
-    """Return lora_id for the current block."""
-    if naive_block_assignment:
-        token_idx = pid_m // top_k_num
-        return tl.load(token_lora_mapping_ptr + token_idx)
-    else:
-        return tl.load(lora_ids + lora_idx)
-
-
-@triton.jit
-def _get_expert_id(
-    expert_ids_ptr,
-    lora_id,
-    pid_m,
-    stride_el,
-    max_loras,
-    naive_block_assignment: tl.constexpr,
-):
-    """Return expert_id for the current block."""
-    if naive_block_assignment:
-        return tl.load(expert_ids_ptr + pid_m)
-    else:
-        ind = lora_id * stride_el + pid_m
-        return tl.load(expert_ids_ptr + ind, ind < max_loras * stride_el, -1)
-
-
-@triton.jit
-def _get_token_offs(
-    sorted_token_ids_ptr,
-    lora_id,
-    pid_m,
-    offs,
-    stride_tl,
-    max_loras,
-    num_valid_tokens,
-    naive_block_assignment: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-):
-    """Return token offsets for each lane in the block."""
-    if naive_block_assignment:
-        raw = pid_m * BLOCK_SIZE_M + offs
-        return tl.where(raw < num_valid_tokens, raw, num_valid_tokens)
-    else:
-        offs_token_id = pid_m * BLOCK_SIZE_M + offs
-        token_ind = stride_tl * lora_id + offs_token_id
-        return tl.load(
-            sorted_token_ids_ptr + token_ind,
-            token_ind < max_loras * stride_tl,
-            num_valid_tokens,
-        )
-
-
-@triton.jit
-def _get_c_ptrs(
-    cur_c_ptr,
-    lora_id,
-    pid_m,
-    offs,
-    offs_token,
-    offs_cn,
-    stride_cm,
-    stride_cn,
-    EM: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    sort_c: tl.constexpr,
-):
-    if sort_c:
-        offs_token_id = pid_m * BLOCK_SIZE_M + offs
-        c_ptrs = (
-            cur_c_ptr
-            + lora_id * EM * stride_cm
-            + stride_cm * offs_token_id[:, None]
-            + stride_cn * offs_cn[None, :]
-        )
-    else:
-        c_ptrs = (
-            cur_c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-        )
-    return c_ptrs
-
-
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.Tensor] = {}
 
 
@@ -138,19 +49,6 @@ def _get_ptr(weight_list: list[torch.Tensor], device: torch.device) -> torch.Ten
     return ptr_tensor
 
 
-def _adjust_kernel_inputs(
-    num_active_loras: torch.Tensor,
-    sorted_token_ids: torch.Tensor | None,
-    expert_ids: torch.Tensor,
-):
-    """Return (grid_lora_dim, stride_tl, stride_el) for the kernel grid."""
-    if sorted_token_ids is None:
-        return 1, 0, 0
-    assert expert_ids.dim() == 2
-    return int(num_active_loras.item()), sorted_token_ids.stride(0), expert_ids.stride(
-        0)
-
-
 @triton.heuristics({"EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0})
 @triton.jit
 def _fused_moe_lora_kernel(
@@ -159,9 +57,7 @@ def _fused_moe_lora_kernel(
     b_ptr,
     c_ptr,
     topk_weights_ptr,
-    sorted_token_ids_ptr,
     expert_ids_ptr,
-    num_tokens_post_padded_ptr,
     token_lora_mapping_ptr,
     lora_ids_ptr,
     adapter_enabled_ptr,
@@ -172,7 +68,6 @@ def _fused_moe_lora_kernel(
     num_tokens,
     num_experts,
     top_k_num,
-    max_loras,
     # ---- strides ----
     stride_am,
     stride_ak,
@@ -182,8 +77,6 @@ def _fused_moe_lora_kernel(
     stride_bk,
     stride_cm,
     stride_cn,
-    stride_tl,
-    stride_el,
     # ---- slice sizes ----
     slice_a_size,
     slice_c_size,
@@ -191,38 +84,22 @@ def _fused_moe_lora_kernel(
     num_slice_c,
     # ---- constexpr ----
     token_mapping_factor: tl.constexpr,
-    naive_block_assignment: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     ADD_INPUTS: tl.constexpr,
-    sort_c: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    SPLIT_K: tl.constexpr,
     EVEN_K: tl.constexpr,
 ):
-    """General MoE-LoRA GEMM kernel used for both shrink and expand.
+    """MoE-LoRA GEMM kernel (naive, SPLIT_K=1, sort_c=False).
 
-    Inputs:
-      a_ptr : 2-D tensor, shape depends on caller (x for shrink,
-              intermediate cache for expand).
-      b_ptr : pointer table of LoRA weight slices.
-      c_ptr : output tensor.
-
-    For each (slice, lora_id, expert_id, token_block, n_block) work item,
-    load the corresponding A tile and B tile, compute the GEMM, optionally
-    multiply by topk weight and add to existing output.
-
-    NPU note: early ``return`` statements, ``lora_ids_ptr.numel()`` calls,
-    and the ``if SPLIT_K == 1: ... else: tl.atomic_add`` pattern all cause
-    the Ascend Triton backend (``ttir_to_linalg``) to crash. They have been
-    replaced by mask-based guarding, a ``max_loras`` runtime argument, and
-    a simple store respectively.
+    For each (slice, token_block, n_block) work item, resolve lora_id /
+    expert_id from the naive 1D tables, load the A and B tiles, compute
+    the GEMM, optionally multiply by topk weight and add to output.
     """
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
-    lora_idx = tl.program_id(axis=2)
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -232,59 +109,33 @@ def _fused_moe_lora_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    pid_sk = pid // (num_pid_m * num_pid_n)
 
-    # Resolve lora_id.
-    lora_id = _get_lora_id(
-        lora_ids_ptr,
-        token_lora_mapping_ptr,
-        lora_idx,
-        pid_m,
-        top_k_num,
-        naive_block_assignment,
-    )
-    # NPU: no early return — clamp lora_id and guard with mask instead.
-    lora_valid = (lora_id >= 0) & (lora_id < max_loras)
-    safe_lora_id = tl.where(lora_valid, lora_id, 0)
-    enabled = tl.load(adapter_enabled_ptr + safe_lora_id)
-    lora_valid = lora_valid & (enabled != 0)
+    # Resolve lora_id from the token at (pid_m // top_k_num).
+    token_idx = pid_m // top_k_num
+    lora_id = tl.load(token_lora_mapping_ptr + token_idx)
+    if lora_id < 0:
+        return
+    if lora_id >= lora_ids_ptr.numel():
+        return
+    enabled = tl.load(adapter_enabled_ptr + lora_id)
+    if enabled == 0:
+        return
 
-    if not naive_block_assignment:
-        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + safe_lora_id)
-        lora_valid = lora_valid & (pid_m * BLOCK_SIZE_M < num_tokens_post_padded)
-
-    # Get expert_id.
-    expert_id = _get_expert_id(
-        expert_ids_ptr,
-        safe_lora_id,
-        pid_m,
-        stride_el,
-        max_loras,
-        naive_block_assignment,
-    )
-    expert_valid = expert_id >= 0
-    safe_expert_id = tl.where(expert_valid, expert_id, 0)
-    valid = lora_valid & expert_valid
+    # Resolve expert_id (naive: 1D table indexed by pid_m).
+    expert_id = tl.load(expert_ids_ptr + pid_m)
+    if expert_id == -1:
+        return
 
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token = _get_token_offs(
-        sorted_token_ids_ptr,
-        safe_lora_id,
-        pid_m,
-        offs,
-        stride_tl,
-        max_loras,
-        num_tokens,
-        naive_block_assignment,
-        BLOCK_SIZE_M,
-    )
-    token_mask = (offs_token < num_tokens) & valid
+    raw = pid_m * BLOCK_SIZE_M + offs
+    offs_token = tl.where(raw < num_tokens, raw, num_tokens)
+    token_mask = offs_token < num_tokens
 
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
     cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
     cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
 
-    offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = cur_a_ptr + (
         offs_token[:, None] // token_mapping_factor * stride_am
         + offs_k[None, :] * stride_ak
@@ -292,16 +143,15 @@ def _fused_moe_lora_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
     b_ptrs = (
         cur_b_ptr
-        + safe_lora_id * stride_bl
-        + safe_expert_id * stride_be
+        + lora_id * stride_bl
+        + expert_id * stride_be
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
-    for k in range(0, grid_k):
-        cur_k_offset = k * (BLOCK_SIZE_K * SPLIT_K)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        cur_k_offset = k * BLOCK_SIZE_K
         k_remaining = K - cur_k_offset
         k_mask = offs_k[None, :] < k_remaining
         a = tl.load(
@@ -312,8 +162,8 @@ def _fused_moe_lora_kernel(
         b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
         b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(
@@ -324,28 +174,18 @@ def _fused_moe_lora_kernel(
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = _get_c_ptrs(
-        cur_c_ptr,
-        safe_lora_id,
-        pid_m,
-        offs,
-        offs_token,
-        offs_cn,
-        stride_cm,
-        stride_cn,
-        EM,
-        BLOCK_SIZE_M,
-        sort_c,
+    c_ptrs = (
+        cur_c_ptr
+        + stride_cm * offs_token[:, None]
+        + stride_cn * offs_cn[None, :]
     )
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
 
-    # NPU: always use simple store — the ``if SPLIT_K == 1: ... else:
-    # tl.atomic_add`` pattern crashes Ascend's ttir_to_linalg on the
-    # dead-code ``tl.atomic_add`` branch even when SPLIT_K is constexpr 1.
     if ADD_INPUTS:
         prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
-        accumulator = accumulator + prev
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+        tl.store(c_ptrs, prev + accumulator, mask=c_mask)
+    else:
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @torch.inference_mode()
@@ -354,9 +194,7 @@ def _fused_moe_lora_shrink(
     qcurr_hidden_states: torch.Tensor,
     lora_a_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor | None,
     token_lora_mapping: torch.Tensor,
     top_k_num: int,
     lora_ids: torch.Tensor,
@@ -375,34 +213,17 @@ def _fused_moe_lora_shrink(
     group_size_m: int,
     num_warps: int,
     num_stages: int,
-    split_k: int,
     num_active_loras: torch.Tensor,
     mul_routed_weight: bool = False,
 ) -> None:
     """Shrink step: x @ lora_a^T -> intermediate cache."""
     w1_lora_a_stacked = lora_a_stacked[0]
 
-    shrink_config = {
-        "BLOCK_SIZE_M": block_size_m,
-        "BLOCK_SIZE_N": block_size_n,
-        "BLOCK_SIZE_K": block_size_k,
-        "GROUP_SIZE_M": group_size_m,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "SPLIT_K": split_k,
-    }
-
     b_ptr = _get_ptr(lora_a_stacked, device)
-    grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
-        num_active_loras, sorted_token_ids, expert_ids
-    )
 
     grid = lambda META: (
-        split_k
-        * triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         len(lora_a_stacked),
-        grid_lora_dim,
     )
 
     _fused_moe_lora_kernel[grid](
@@ -410,9 +231,7 @@ def _fused_moe_lora_shrink(
         b_ptr,
         a_intermediate_cache1,
         topk_weights,
-        sorted_token_ids,
         expert_ids,
-        num_tokens_post_padded,
         token_lora_mapping,
         lora_ids,
         adapter_enabled,
@@ -422,7 +241,6 @@ def _fused_moe_lora_shrink(
         num_tokens,
         num_experts,
         top_k_num,
-        lora_a_stacked[0].shape[0],
         qcurr_hidden_states.stride(0),
         qcurr_hidden_states.stride(1),
         w1_lora_a_stacked.stride(0),
@@ -431,18 +249,19 @@ def _fused_moe_lora_shrink(
         w1_lora_a_stacked.stride(2),
         a_intermediate_cache1.stride(-2),
         a_intermediate_cache1.stride(-1),
-        stride_tl,
-        stride_el,
         slice_a_size=qcurr_hidden_states.numel(),
         slice_c_size=a_intermediate_cache1.numel() // num_slices,
         num_slice_a=1,
         num_slice_c=num_slices,
         token_mapping_factor=1 if mul_routed_weight else top_k_num,
-        naive_block_assignment=sorted_token_ids is None,
         MUL_ROUTED_WEIGHT=False,
         ADD_INPUTS=False,
-        sort_c=False,
-        **shrink_config,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=group_size_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -452,9 +271,7 @@ def _fused_moe_lora_expand(
     a_intermediate_cache1: torch.Tensor,
     lora_b_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor | None,
     token_lora_mapping: torch.Tensor,
     top_k_num: int,
     lora_ids: torch.Tensor,
@@ -475,7 +292,6 @@ def _fused_moe_lora_expand(
     group_size_m: int,
     num_warps: int,
     num_stages: int,
-    split_k: int,
     num_active_loras: torch.Tensor,
     mul_routed_weight: bool = False,
     offset: int = 0,
@@ -490,24 +306,9 @@ def _fused_moe_lora_expand(
         -1, a_intermediate_cache1.shape[-1]
     )
 
-    expand_config = {
-        "BLOCK_SIZE_M": block_size_m,
-        "BLOCK_SIZE_N": block_size_n,
-        "BLOCK_SIZE_K": block_size_k,
-        "GROUP_SIZE_M": group_size_m,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "SPLIT_K": 1,  # No split-K on expand path.
-    }
-
-    grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
-        num_active_loras, sorted_token_ids, expert_ids
-    )
-
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         len(lora_b_stacked),
-        grid_lora_dim,
     )
 
     out_view = output[:, :, offset : offset + num_slices * N]
@@ -518,9 +319,7 @@ def _fused_moe_lora_expand(
         b_ptr,
         out_view,
         topk_weights,
-        sorted_token_ids,
         expert_ids,
-        num_tokens_post_padded,
         token_lora_mapping,
         lora_ids,
         adapter_enabled,
@@ -530,7 +329,6 @@ def _fused_moe_lora_expand(
         num_tokens,
         num_experts,
         top_k_num,
-        lora_b_stacked[0].shape[0],
         a_intermediate_cache1.stride(0),
         a_intermediate_cache1.stride(1),
         w1_lora_b_stacked.stride(0),
@@ -539,18 +337,19 @@ def _fused_moe_lora_expand(
         w1_lora_b_stacked.stride(2),
         out_view.stride(1),
         out_view.stride(2),
-        stride_tl,
-        stride_el,
         slice_a_size=a_intermediate_cache1.numel() // num_slices,
         slice_c_size=slice_c_size,
         num_slice_a=num_slices,
         num_slice_c=num_slices,
         token_mapping_factor=1,
-        naive_block_assignment=sorted_token_ids is None,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         ADD_INPUTS=True,
-        sort_c=False,
-        **expand_config,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=group_size_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -561,9 +360,7 @@ def _fused_moe_lora(
     lora_a_stacked: list[torch.Tensor],
     lora_b_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor | None,
     token_lora_mapping: torch.Tensor,
     max_lora_rank: int,
     top_k_num: int,
@@ -576,14 +373,12 @@ def _fused_moe_lora(
     shrink_group_size_m: int,
     shrink_num_warps: int,
     shrink_num_stages: int,
-    shrink_split_k: int,
     expand_block_size_m: int,
     expand_block_size_n: int,
     expand_block_size_k: int,
     expand_group_size_m: int,
     expand_num_warps: int,
     expand_num_stages: int,
-    expand_split_k: int,
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
@@ -596,22 +391,7 @@ def _fused_moe_lora(
     """
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert topk_weights.dim() == qcurr_hidden_states.dim() == 2
-    if sorted_token_ids is None:
-        assert expert_ids.dim() == 1
-    else:
-        assert num_tokens_post_padded is not None
-        assert (
-            sorted_token_ids.dim()
-            == expert_ids.dim()
-            == topk_weights.dim()
-            == qcurr_hidden_states.dim()
-            == 2
-        )
-        assert (
-            sorted_token_ids.shape[0]
-            == expert_ids.shape[0]
-            == num_tokens_post_padded.shape[0]
-        )
+    assert expert_ids.dim() == 1
     assert output.shape[0] == topk_weights.shape[0]
     assert top_k_num == topk_weights.shape[1]
     assert shrink_block_size_m == expand_block_size_m
@@ -630,11 +410,7 @@ def _fused_moe_lora(
     K = qcurr_hidden_states.shape[1]
     num_tokens = M * top_k_num
     w1_output_dim_size = w1_lora_b_stacked.shape[2]
-    EM = (
-        sorted_token_ids.shape[1]
-        if sorted_token_ids is not None
-        else num_tokens
-    )
+    EM = num_tokens
 
     intermediate_cache_shape = (
         num_slices,
@@ -653,9 +429,7 @@ def _fused_moe_lora(
         qcurr_hidden_states,
         lora_a_stacked,
         topk_weights,
-        sorted_token_ids,
         expert_ids,
-        num_tokens_post_padded,
         token_lora_mapping,
         top_k_num,
         lora_ids,
@@ -674,7 +448,6 @@ def _fused_moe_lora(
         shrink_group_size_m,
         shrink_num_warps,
         shrink_num_stages,
-        shrink_split_k,
         num_active_loras,
         mul_routed_weight,
     )
@@ -695,9 +468,7 @@ def _fused_moe_lora(
         a_intermediate_cache1,
         lora_b_stacked,
         topk_weights,
-        sorted_token_ids,
         expert_ids,
-        num_tokens_post_padded,
         token_lora_mapping,
         top_k_num,
         lora_ids,
@@ -718,7 +489,6 @@ def _fused_moe_lora(
         expand_group_size_m,
         expand_num_warps,
         expand_num_stages,
-        expand_split_k,
         num_active_loras,
         mul_routed_weight,
         offset,
@@ -755,3 +525,91 @@ except AttributeError:
     fused_moe_lora = _fused_moe_lora
     fused_moe_lora_shrink = _fused_moe_lora_shrink
     fused_moe_lora_expand = _fused_moe_lora_expand
+
+
+
+if __name__ == "__main__":
+    device = torch.device("npu")
+
+    # ---- Sub-test 1: single expert, top_k_num=2 ----
+    # All pairs use expert 0; one M-tile covers all 8 pairs.
+    torch.manual_seed(0)
+    M, K, N, tk = 4, 64, 16, 2
+    num_experts, max_loras, num_slices = 1, 2, 1
+    EM = M * tk  # 8
+
+    hidden = torch.randn(M, K, dtype=torch.float32, device=device)
+    lora_a = torch.randn(
+        max_loras, num_experts, N, K, dtype=torch.float32, device=device
+    ).contiguous()
+    topk_weights = torch.rand(M, tk, dtype=torch.float32, device=device)
+    topk_ids = torch.zeros(M, tk, dtype=torch.int32, device=device)
+    expert_ids = torch.tensor([0], dtype=torch.int32, device=device)
+    token_lora_mapping = torch.zeros(M, dtype=torch.int32, device=device)
+    lora_ids = torch.tensor([0], dtype=torch.int32, device=device)
+    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32, device=device)
+    num_active_loras = torch.tensor([1], dtype=torch.int32, device="cpu")
+
+    cache = torch.zeros(
+        num_slices, M, tk, N, dtype=torch.float32, device=device
+    )
+
+    _LORA_PTR_DICT.clear()
+    _fused_moe_lora_shrink(
+        cache, hidden, [lora_a], topk_weights, expert_ids,
+        token_lora_mapping, tk, lora_ids, adapter_enabled,
+        device,
+        N, M, EM, K, EM, num_experts, num_slices,
+        16, 16, 64, 1, 4, 3, num_active_loras, False,
+    )
+
+    ref = torch.zeros(num_slices, M, tk, N, dtype=torch.float32)
+    for i in range(M):
+        for x in range(tk):
+            ref[0, i, x] = hidden[i].cpu() @ lora_a[0, 0].T
+
+    err1 = (cache.cpu() - ref).abs().max().item()
+    print(f"  fused_moe_lora_shrink_triton (single-expert) max_err={err1:.2e}")
+    _smoke_assert("fused_moe_lora_shrink_triton_single_expert", err1 < 1e-4)
+
+    # ---- Sub-test 2: multi-block, multi-expert, top_k_num=1 ----
+    # Block 0 (tokens 0-15) → expert 0; block 1 (tokens 16-31) → expert 1.
+    torch.manual_seed(1)
+    M2, K2, N2, tk2 = 32, 64, 16, 1
+    num_experts2, max_loras2, num_slices2 = 2, 2, 1
+    EM2 = M2 * tk2  # 32
+
+    hidden2 = torch.randn(M2, K2, dtype=torch.float32, device=device)
+    lora_a2 = torch.randn(
+        max_loras2, num_experts2, N2, K2, dtype=torch.float32, device=device
+    ).contiguous()
+    topk_ids2 = torch.zeros(M2, tk2, dtype=torch.int32, device=device)
+    topk_ids2[M2 // 2:, 0] = 1
+    expert_ids2 = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    token_lora_mapping2 = torch.zeros(M2, dtype=torch.int32, device=device)
+    topk_weights2 = torch.rand(M2, tk2, dtype=torch.float32, device=device)
+    lora_ids2 = torch.tensor([0], dtype=torch.int32, device=device)
+    adapter_enabled2 = torch.ones(max_loras2 + 1, dtype=torch.int32, device=device)
+    num_active_loras2 = torch.tensor([1], dtype=torch.int32, device="cpu")
+
+    cache2 = torch.zeros(
+        num_slices2, M2, tk2, N2, dtype=torch.float32, device=device
+    )
+
+    _LORA_PTR_DICT.clear()
+    _fused_moe_lora_shrink(
+        cache2, hidden2, [lora_a2], topk_weights2, expert_ids2,
+        token_lora_mapping2, tk2, lora_ids2, adapter_enabled2,
+        device,
+        N2, M2, EM2, K2, EM2, num_experts2, num_slices2,
+        16, 16, 64, 1, 4, 3, num_active_loras2, False,
+    )
+
+    ref2 = torch.zeros(num_slices2, M2, tk2, N2, dtype=torch.float32)
+    for i in range(M2):
+        eid = int(topk_ids2[i, 0].item())
+        ref2[0, i, 0] = hidden2[i].cpu() @ lora_a2[0, eid].T
+
+    err2 = (cache2.cpu() - ref2).abs().max().item()
+    print(f"  fused_moe_lora_shrink_triton (multi-expert) max_err={err2:.2e}")
+    _smoke_assert("fused_moe_lora_shrink_triton_multi_expert", err2 < 1e-4)
