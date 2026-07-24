@@ -111,8 +111,10 @@ def _fused_moe_lora_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Resolve lora_id from the token at (pid_m // top_k_num).
-    token_idx = pid_m // top_k_num
+    # Resolve lora_id from the first token covered by this tile.
+    # A tile spans BLOCK_SIZE_M pairs; the first pair's token index is
+    # (pid_m * BLOCK_SIZE_M) // top_k_num.
+    token_idx = (pid_m * BLOCK_SIZE_M) // top_k_num
     lora_id = tl.load(token_lora_mapping_ptr + token_idx)
     if lora_id < 0:
         return
@@ -554,6 +556,11 @@ except AttributeError:
     fused_moe_lora_expand = _fused_moe_lora_expand
 
 
+def _make_lora_ids(max_loras: int, device: torch.device) -> torch.Tensor:
+    """Dense [0, 1, ..., max_loras] mapping for the inline sanity tests."""
+    return torch.arange(max_loras + 1, dtype=torch.int32, device=device)
+
+
 def test_fused_moe_lora_shrink():
     device = torch.device("npu")
 
@@ -603,8 +610,10 @@ def test_fused_moe_lora_shrink():
     err1 = (cache.cpu() - ref).abs().max().item()
     print(f"  fused_moe_lora_shrink_triton (single-expert) max_err={err1:.2e}")
 
-    # ---- Sub-test 2: multi-block, multi-expert, top_k_num=1 ----
-    # Block 0 (tokens 0-15) → expert 0; block 1 (tokens 16-31) → expert 1.
+    # ---- Sub-test 2: multi-block, multi-expert, top_k_num=1,
+    #                  multiple LoRAs (one LoRA per tile) ----
+    # Block 0 (tokens 0-15) → expert 0 / LoRA 0;
+    # Block 1 (tokens 16-31) → expert 1 / LoRA 1.
     torch.manual_seed(1)
     M2, K2, N2, tk2 = 32, 64, 16, 1
     num_experts2, max_loras2, num_slices2 = 2, 2, 1
@@ -618,10 +627,15 @@ def test_fused_moe_lora_shrink():
     topk_ids2[M2 // 2:, 0] = 1
     expert_ids2 = torch.tensor([0, 1], dtype=torch.int32, device=device)
     token_lora_mapping2 = torch.zeros(M2, dtype=torch.int32, device=device)
+    token_lora_mapping2[M2 // 2:] = 1
     topk_weights2 = torch.rand(M2, tk2, dtype=torch.float32, device=device)
-    lora_ids2 = torch.tensor([0], dtype=torch.int32, device=device)
-    adapter_enabled2 = torch.ones(max_loras2 + 1, dtype=torch.int32, device=device)
-    num_active_loras2 = torch.tensor([1], dtype=torch.int32, device="cpu")
+    lora_ids2 = _make_lora_ids(max_loras2, device)
+    adapter_enabled2 = torch.ones(
+        max_loras2 + 1, dtype=torch.int32, device=device
+    )
+    num_active_loras2 = torch.tensor(
+        [max_loras2 + 1], dtype=torch.int32, device="cpu"
+    )
 
     cache2 = torch.zeros(
         num_slices2, M2, tk2, N2, dtype=torch.float32, device=device
@@ -643,12 +657,71 @@ def test_fused_moe_lora_shrink():
     ref2 = torch.zeros(num_slices2, M2, tk2, N2, dtype=torch.float32)
     lora_a2_cpu = lora_a2.cpu()
     hidden2_cpu = hidden2.cpu()
+    token_lora_mapping2_cpu = token_lora_mapping2.cpu()
     for i in range(M2):
+        lora_idx = int(token_lora_mapping2_cpu[i].item())
         eid = int(topk_ids2[i, 0].item())
-        ref2[0, i, 0] = hidden2_cpu[i] @ lora_a2_cpu[0, eid].T
+        ref2[0, i, 0] = hidden2_cpu[i] @ lora_a2_cpu[lora_idx, eid].T
 
     err2 = (cache2.cpu() - ref2).abs().max().item()
-    print(f"  fused_moe_lora_shrink_triton (multi-expert) max_err={err2:.2e}")
+    print(f"  shrink (multi-expert+multi-LoRA) max_err={err2:.2e}")
+
+    # ---- Sub-test 3: LoRAs not aligned within a tile ----
+    # Each 16-token tile contains two 8-token blocks with different LoRAs.
+    # The kernel uses the first token's LoRA for the whole tile, so the
+    # reference is built using that tile-level LoRA.
+    torch.manual_seed(2)
+    M3, K3, N3, tk3 = 32, 64, 16, 1
+    num_experts3, max_loras3, num_slices3 = 1, 2, 1
+    EM3 = M3 * tk3  # 32
+
+    hidden3 = torch.randn(M3, K3, dtype=torch.float32, device=device)
+    lora_a3 = torch.randn(
+        max_loras3, num_experts3, N3, K3, dtype=torch.float32, device=device
+    ).contiguous()
+    topk_ids3 = torch.zeros(M3, tk3, dtype=torch.int32, device=device)
+    expert_ids3 = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    token_lora_mapping3 = torch.zeros(M3, dtype=torch.int32, device=device)
+    token_lora_mapping3[8:16] = 1
+    token_lora_mapping3[16:24] = 1
+    topk_weights3 = torch.rand(M3, tk3, dtype=torch.float32, device=device)
+    lora_ids3 = _make_lora_ids(max_loras3, device)
+    adapter_enabled3 = torch.ones(
+        max_loras3 + 1, dtype=torch.int32, device=device
+    )
+    num_active_loras3 = torch.tensor(
+        [max_loras3 + 1], dtype=torch.int32, device="cpu"
+    )
+
+    cache3 = torch.zeros(
+        num_slices3, M3, tk3, N3, dtype=torch.float32, device=device
+    )
+
+    _LORA_PTR_DICT.clear()
+    _fused_moe_lora_shrink(
+        cache3, hidden3, [lora_a3], topk_weights3,
+        None,
+        expert_ids3,
+        None,  # num_tokens_post_padded
+        token_lora_mapping3, tk3, lora_ids3, adapter_enabled3,
+        device,
+        N3, M3, EM3, K3, EM3, num_experts3, num_slices3,
+        16, 16, 64, 1, 4, 3, 1, num_active_loras3, False,
+        False, False,
+    )
+
+    ref3 = torch.zeros(num_slices3, M3, tk3, N3, dtype=torch.float32)
+    lora_a3_cpu = lora_a3.cpu()
+    hidden3_cpu = hidden3.cpu()
+    token_lora_mapping3_cpu = token_lora_mapping3.cpu()
+    block_size3 = 16 // tk3
+    for i in range(M3):
+        tile = i // block_size3
+        lora_idx = int(token_lora_mapping3_cpu[tile * block_size3].item())
+        ref3[0, i, 0] = hidden3_cpu[i] @ lora_a3_cpu[lora_idx, 0].T
+
+    err3 = (cache3.cpu() - ref3).abs().max().item()
+    print(f"  shrink (non-tile-aligned LoRA) max_err={err3:.2e}")
 
 
 def test_fused_moe_lora_expand():
@@ -722,7 +795,8 @@ def test_fused_moe_lora_expand():
     err1 = (output.cpu() - output_cpu_ref).abs().max().item()
     print(f"  fused_moe_lora_expand_triton (single-expert) max_err={err1:.2e}")
 
-    # ---- Sub-test 2: multi-expert, top_k_num=1, MUL_ROUTED_WEIGHT=True ----
+    # ---- Sub-test 2: multi-expert, top_k_num=1, MUL_ROUTED_WEIGHT=True,
+    #                  multiple LoRAs (one LoRA per tile) ----
     torch.manual_seed(11)
     M2, K2, r2, tk2 = 32, 64, 16, 1
     w1_out2 = 48
@@ -742,12 +816,19 @@ def test_fused_moe_lora_expand():
     # BLOCK_SIZE_M=16, EM=32 -> num_pid_m=2; block0->expert0, block1->expert1.
     expert_ids2 = torch.tensor([0, 1], dtype=torch.int32, device=device)
     token_lora_mapping2 = torch.zeros(M2, dtype=torch.int32, device=device)
+    token_lora_mapping2[M2 // 2:] = 1
     topk_weights2 = torch.rand(M2, tk2, dtype=torch.float32, device=device)
-    lora_ids2 = torch.tensor([0], dtype=torch.int32, device=device)
-    adapter_enabled2 = torch.ones(max_loras2 + 1, dtype=torch.int32, device=device)
-    num_active_loras2 = torch.tensor([1], dtype=torch.int32, device="cpu")
+    lora_ids2 = _make_lora_ids(max_loras2, device)
+    adapter_enabled2 = torch.ones(
+        max_loras2 + 1, dtype=torch.int32, device=device
+    )
+    num_active_loras2 = torch.tensor(
+        [max_loras2 + 1], dtype=torch.int32, device="cpu"
+    )
 
-    cache2 = torch.zeros(num_slices2, M2, tk2, r2, dtype=torch.float32, device=device)
+    cache2 = torch.zeros(
+        num_slices2, M2, tk2, r2, dtype=torch.float32, device=device
+    )
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
         cache2, hidden2, [lora_a2], topk_weights2,
@@ -780,20 +861,99 @@ def test_fused_moe_lora_expand():
         False, False,
     )
 
-    # Reference: out[i,0] += (cache[0,i,0] @ lora_b[0,eid].T) * topk_w[i,0]
+    # Reference: out[i,0] += (cache[0,i,0] @ lora_b[lora_idx,eid].T) * w
     cache2_cpu = cache2.cpu()
     lora_b2_cpu = lora_b2.cpu()
     topk_w2_cpu = topk_weights2.cpu()
     topk_ids2_cpu = topk_ids2.cpu()
+    token_lora_mapping2_cpu = token_lora_mapping2.cpu()
     output2_cpu_ref = output2_orig.cpu()
     for i in range(M2):
+        lora_idx = int(token_lora_mapping2_cpu[i].item())
         eid = int(topk_ids2_cpu[i, 0].item())
         w = float(topk_w2_cpu[i, 0].item())
-        delta = cache2_cpu[0, i, 0] @ lora_b2_cpu[0, eid].T
+        delta = cache2_cpu[0, i, 0] @ lora_b2_cpu[lora_idx, eid].T
         output2_cpu_ref[i, 0] += delta * w
 
     err2 = (output2.cpu() - output2_cpu_ref).abs().max().item()
-    print(f"  fused_moe_lora_expand_triton (multi-expert+routed) max_err={err2:.2e}")
+    print(f"  expand (multi-expert+routed+multi-LoRA) max_err={err2:.2e}")
+
+    # ---- Sub-test 3: LoRAs not aligned within a tile ----
+    torch.manual_seed(12)
+    M3, K3, r3, tk3 = 32, 64, 16, 1
+    w1_out3 = 48
+    num_experts3, max_loras3, num_slices3 = 1, 2, 1
+    EM3 = M3 * tk3  # 32
+
+    hidden3 = torch.randn(M3, K3, dtype=torch.float32, device=device)
+    lora_a3 = torch.randn(
+        max_loras3, num_experts3, r3, K3, dtype=torch.float32, device=device
+    ).contiguous()
+    lora_b3 = torch.randn(
+        max_loras3, num_experts3, w1_out3, r3, dtype=torch.float32, device=device
+    ).contiguous()
+    topk_ids3 = torch.zeros(M3, tk3, dtype=torch.int32, device=device)
+    expert_ids3 = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    token_lora_mapping3 = torch.zeros(M3, dtype=torch.int32, device=device)
+    token_lora_mapping3[8:16] = 1
+    token_lora_mapping3[16:24] = 1
+    topk_weights3 = torch.rand(M3, tk3, dtype=torch.float32, device=device)
+    lora_ids3 = _make_lora_ids(max_loras3, device)
+    adapter_enabled3 = torch.ones(
+        max_loras3 + 1, dtype=torch.int32, device=device
+    )
+    num_active_loras3 = torch.tensor(
+        [max_loras3 + 1], dtype=torch.int32, device="cpu"
+    )
+
+    cache3 = torch.zeros(
+        num_slices3, M3, tk3, r3, dtype=torch.float32, device=device
+    )
+    _LORA_PTR_DICT.clear()
+    _fused_moe_lora_shrink(
+        cache3, hidden3, [lora_a3], topk_weights3,
+        None,
+        expert_ids3,
+        None,  # num_tokens_post_padded
+        token_lora_mapping3, tk3, lora_ids3, adapter_enabled3,
+        device,
+        r3, M3, EM3, K3, EM3, num_experts3, num_slices3,
+        16, 16, 64, 1, 4, 3, 1, num_active_loras3, False,
+        False, False,
+    )
+
+    output3 = torch.randn(
+        M3, tk3, num_slices3 * w1_out3, dtype=torch.float32, device=device
+    )
+    output3_orig = output3.clone()
+
+    _LORA_PTR_DICT.clear()
+    _fused_moe_lora_expand(
+        output3, cache3, [lora_b3], topk_weights3,
+        None,  # sorted_token_ids
+        expert_ids3,
+        None,  # num_tokens_post_padded
+        token_lora_mapping3, tk3, lora_ids3, adapter_enabled3,
+        device,
+        w1_out3, M3, EM3, r3, EM3, num_experts3, num_slices3,
+        r3, w1_out3,
+        16, 16, 16, 1, 4, 3, 1, num_active_loras3, False, 0,
+        False, False,
+    )
+
+    # Reference uses the tile-level LoRA (first token of the tile).
+    cache3_cpu = cache3.cpu()
+    lora_b3_cpu = lora_b3.cpu()
+    token_lora_mapping3_cpu = token_lora_mapping3.cpu()
+    output3_cpu_ref = output3_orig.cpu()
+    block_size3 = 16 // tk3
+    for i in range(M3):
+        tile = i // block_size3
+        lora_idx = int(token_lora_mapping3_cpu[tile * block_size3].item())
+        output3_cpu_ref[i, 0] += cache3_cpu[0, i, 0] @ lora_b3_cpu[lora_idx, 0].T
+
+    err3 = (output3.cpu() - output3_cpu_ref).abs().max().item()
+    print(f"  expand (non-tile-aligned LoRA) max_err={err3:.2e}")
 
 
 def test_fused_moe_lora():
@@ -850,7 +1010,8 @@ def test_fused_moe_lora():
     err1 = (output.cpu() - ref).abs().max().item()
     print(f"  fused_moe_lora (single-expert) max_err={err1:.2e}")
 
-    # ---- Sub-test 2: multi-expert, routed weight, top_k_num=1 ----
+    # ---- Sub-test 2: multi-expert, routed weight, top_k_num=1,
+    #                  multiple LoRAs (one LoRA per tile) ----
     torch.manual_seed(21)
     M2, K2, r2, tk2 = 32, 64, 16, 1
     w1_out2 = 48
@@ -870,10 +1031,15 @@ def test_fused_moe_lora():
     # BLOCK_SIZE_M=16, EM=32 -> num_pid_m=2; block0->expert0, block1->expert1.
     expert_ids2 = torch.tensor([0, 1], dtype=torch.int32, device=device)
     token_lora_mapping2 = torch.zeros(M2, dtype=torch.int32, device=device)
+    token_lora_mapping2[M2 // 2:] = 1
     topk_weights2 = torch.rand(M2, tk2, dtype=torch.float32, device=device)
-    lora_ids2 = torch.tensor([0], dtype=torch.int32, device=device)
-    adapter_enabled2 = torch.ones(max_loras2 + 1, dtype=torch.int32, device=device)
-    num_active_loras2 = torch.tensor([1], dtype=torch.int32, device="cpu")
+    lora_ids2 = _make_lora_ids(max_loras2, device)
+    adapter_enabled2 = torch.ones(
+        max_loras2 + 1, dtype=torch.int32, device=device
+    )
+    num_active_loras2 = torch.tensor(
+        [max_loras2 + 1], dtype=torch.int32, device="cpu"
+    )
 
     output2 = torch.zeros(
         M2, tk2, num_slices2 * w1_out2, dtype=torch.float32, device=device
@@ -894,21 +1060,94 @@ def test_fused_moe_lora():
         add_inputs=True,
     )
 
-    # Reference: out[i,0] = (hidden[i] @ lora_a[0,eid].T @ lora_b[0,eid].T) * w
+    # Reference: out[i,0] = (hidden[i] @ lora_a[lora_idx,eid].T
+    #                              @ lora_b[lora_idx,eid].T) * w
     hidden2_cpu = hidden2.cpu()
     lora_a2_cpu = lora_a2.cpu()
     lora_b2_cpu = lora_b2.cpu()
     topk_w2_cpu = topk_weights2.cpu()
     topk_ids2_cpu = topk_ids2.cpu()
+    token_lora_mapping2_cpu = token_lora_mapping2.cpu()
     ref2 = torch.zeros(M2, tk2, num_slices2 * w1_out2, dtype=torch.float32)
     for i in range(M2):
+        lora_idx = int(token_lora_mapping2_cpu[i].item())
         eid = int(topk_ids2_cpu[i, 0].item())
         w = float(topk_w2_cpu[i, 0].item())
-        delta = hidden2_cpu[i] @ lora_a2_cpu[0, eid].T @ lora_b2_cpu[0, eid].T
+        delta = (
+            hidden2_cpu[i]
+            @ lora_a2_cpu[lora_idx, eid].T
+            @ lora_b2_cpu[lora_idx, eid].T
+        )
         ref2[i, 0] = delta * w
 
     err2 = (output2.cpu() - ref2).abs().max().item()
-    print(f"  fused_moe_lora (multi-expert+routed) max_err={err2:.2e}")
+    print(f"  fused_moe_lora (multi-expert+routed+multi-LoRA) max_err={err2:.2e}")
+
+    # ---- Sub-test 3: LoRAs not aligned within a tile ----
+    torch.manual_seed(22)
+    M3, K3, r3, tk3 = 32, 64, 16, 1
+    w1_out3 = 48
+    num_experts3, max_loras3 = 1, 2
+    num_slices3 = 1
+
+    hidden3 = torch.randn(M3, K3, dtype=torch.float32, device=device)
+    lora_a3 = torch.randn(
+        max_loras3, num_experts3, r3, K3, dtype=torch.float32, device=device
+    ).contiguous()
+    lora_b3 = torch.randn(
+        max_loras3, num_experts3, w1_out3, r3, dtype=torch.float32, device=device
+    ).contiguous()
+    topk_ids3 = torch.zeros(M3, tk3, dtype=torch.int32, device=device)
+    expert_ids3 = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    token_lora_mapping3 = torch.zeros(M3, dtype=torch.int32, device=device)
+    token_lora_mapping3[8:16] = 1
+    token_lora_mapping3[16:24] = 1
+    topk_weights3 = torch.rand(M3, tk3, dtype=torch.float32, device=device)
+    lora_ids3 = _make_lora_ids(max_loras3, device)
+    adapter_enabled3 = torch.ones(
+        max_loras3 + 1, dtype=torch.int32, device=device
+    )
+    num_active_loras3 = torch.tensor(
+        [max_loras3 + 1], dtype=torch.int32, device="cpu"
+    )
+
+    output3 = torch.zeros(
+        M3, tk3, num_slices3 * w1_out3, dtype=torch.float32, device=device
+    )
+
+    _LORA_PTR_DICT.clear()
+    _fused_moe_lora(
+        output3, hidden3, [lora_a3], [lora_b3], topk_weights3,
+        None,  # sorted_token_ids
+        expert_ids3,
+        None,  # num_tokens_post_padded
+        token_lora_mapping3, r3, tk3, lora_ids3, num_active_loras3, adapter_enabled3,
+        16, 16, 64, 1, 4, 3, 1,
+        16, 16, 16, 1, 4, 3, 1,
+        mul_routed_weight=False,
+        fully_sharded=False,
+        offset=0,
+        add_inputs=True,
+    )
+
+    # Reference uses the tile-level LoRA (first token of the tile).
+    hidden3_cpu = hidden3.cpu()
+    lora_a3_cpu = lora_a3.cpu()
+    lora_b3_cpu = lora_b3.cpu()
+    token_lora_mapping3_cpu = token_lora_mapping3.cpu()
+    ref3 = torch.zeros(M3, tk3, num_slices3 * w1_out3, dtype=torch.float32)
+    block_size3 = 16 // tk3
+    for i in range(M3):
+        tile = i // block_size3
+        lora_idx = int(token_lora_mapping3_cpu[tile * block_size3].item())
+        ref3[i, 0] = (
+            hidden3_cpu[i]
+            @ lora_a3_cpu[lora_idx, 0].T
+            @ lora_b3_cpu[lora_idx, 0].T
+        )
+
+    err3 = (output3.cpu() - ref3).abs().max().item()
+    print(f"  fused_moe_lora (non-tile-aligned LoRA) max_err={err3:.2e}")
 
 
 if __name__ == "__main__":
