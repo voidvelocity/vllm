@@ -91,22 +91,24 @@ EXPAND_CONFIG = {
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
-    """Split ``num_tokens`` into ``num_sequences`` sequences; each sequence
-    gets a single random LoRA id applied to all its tokens."""
-    assert num_sequences > 0 and max_loras > 0
-    assert num_tokens >= num_sequences
+def assign_loras_block_aligned(
+    num_tokens: int, block_size: int, max_loras: int
+):
+    """Assign a random LoRA id to each block of ``block_size`` tokens.
 
-    tokens_per_seq = num_tokens // num_sequences
-    remainder = num_tokens % num_sequences
+    The NPU kernel resolves one LoRA id per tile, so all tokens that fall
+    into the same tile must share the same LoRA.  Calling code must pass
+    ``block_size = BLOCK_SIZE_M // top_k_num`` for the relevant kernel.
+    """
+    assert block_size > 0 and max_loras > 0
+    assert num_tokens % block_size == 0, (
+        f"num_tokens={num_tokens} must be divisible by block_size={block_size}"
+    )
 
     token_lora_mapping = torch.empty(num_tokens, dtype=torch.int32)
-    start = 0
-    for seq_idx in range(num_sequences):
-        end = start + tokens_per_seq + (1 if seq_idx < remainder else 0)
+    for block_start in range(0, num_tokens, block_size):
         lora_id = random.randint(0, max_loras - 1)
-        token_lora_mapping[start:end] = lora_id
-        start = end
+        token_lora_mapping[block_start : block_start + block_size] = lora_id
     return token_lora_mapping
 
 
@@ -457,12 +459,12 @@ def check_fused_moe_lora_shrink(
     set_random_seed(seed)
     random.seed(seed)
 
-    num_sequences = max(1, min(num_tokens, 4))
+    lora_block_size = SHRINK_CONFIG["BLOCK_SIZE_M"] // top_k_num
     topk_ids, topk_weights, expert_ids = assign_experts_block_aligned(
         num_tokens, num_experts, top_k_num, SHRINK_CONFIG["BLOCK_SIZE_M"]
     )
-    token_lora_mapping = assign_loras_to_tokens(
-        num_tokens, num_sequences, max_loras
+    token_lora_mapping = assign_loras_block_aligned(
+        num_tokens, lora_block_size, max_loras
     )
     lora_ids = _prepare_lora_ids(token_lora_mapping, max_loras)
 
@@ -523,12 +525,12 @@ def check_fused_moe_lora_expand(
     set_random_seed(seed)
     random.seed(seed)
 
-    num_sequences = max(1, min(num_tokens, 4))
+    lora_block_size = EXPAND_CONFIG["BLOCK_SIZE_M"] // top_k_num
     topk_ids, topk_weights, expert_ids = assign_experts_block_aligned(
         num_tokens, num_experts, top_k_num, EXPAND_CONFIG["BLOCK_SIZE_M"]
     )
-    token_lora_mapping = assign_loras_to_tokens(
-        num_tokens, num_sequences, max_loras
+    token_lora_mapping = assign_loras_block_aligned(
+        num_tokens, lora_block_size, max_loras
     )
     lora_ids = _prepare_lora_ids(token_lora_mapping, max_loras)
 
@@ -594,12 +596,12 @@ def check_fused_moe_lora_full(
     set_random_seed(seed)
     random.seed(seed)
 
-    num_sequences = max(1, min(num_tokens, 4))
+    lora_block_size = SHRINK_CONFIG["BLOCK_SIZE_M"] // top_k_num
     topk_ids, topk_weights, expert_ids = assign_experts_block_aligned(
         num_tokens, num_experts, top_k_num, SHRINK_CONFIG["BLOCK_SIZE_M"]
     )
-    token_lora_mapping = assign_loras_to_tokens(
-        num_tokens, num_sequences, max_loras
+    token_lora_mapping = assign_loras_block_aligned(
+        num_tokens, lora_block_size, max_loras
     )
     lora_ids = _prepare_lora_ids(token_lora_mapping, max_loras)
 
