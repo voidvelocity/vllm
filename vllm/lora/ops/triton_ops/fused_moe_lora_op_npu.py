@@ -692,7 +692,7 @@ def test_fused_moe_lora_expand():
         16, 16, 64, 1, 4, 3, 1, num_active_loras, False,
         False, False,
     )
-
+    
     # Step 2: run expand with ADD_INPUTS=True onto a non-zero output
     output = torch.randn(M, tk, num_slices * w1_out, dtype=torch.float32, device=device)
     output_orig = output.clone()
