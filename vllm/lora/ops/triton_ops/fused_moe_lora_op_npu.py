@@ -195,6 +195,7 @@ def _fused_moe_lora_shrink(
     qcurr_hidden_states: torch.Tensor,
     lora_a_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor | None, # UnusedVar
     token_lora_mapping: torch.Tensor,
@@ -445,6 +446,7 @@ def _fused_moe_lora(
         qcurr_hidden_states,
         lora_a_stacked,
         topk_weights,
+        None,
         expert_ids,
         None,  # num_tokens_post_padded
         token_lora_mapping,
@@ -580,7 +582,9 @@ def test_fused_moe_lora_shrink():
 
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
-        cache, hidden, [lora_a], topk_weights, expert_ids,
+        cache, hidden, [lora_a], topk_weights,
+        None,
+        expert_ids,
         None,  # num_tokens_post_padded
         token_lora_mapping, tk, lora_ids, adapter_enabled,
         device,
@@ -625,7 +629,9 @@ def test_fused_moe_lora_shrink():
 
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
-        cache2, hidden2, [lora_a2], topk_weights2, expert_ids2,
+        cache2, hidden2, [lora_a2], topk_weights2,
+        None,
+        expert_ids2,
         None,  # num_tokens_post_padded
         token_lora_mapping2, tk2, lora_ids2, adapter_enabled2,
         device,
@@ -676,7 +682,9 @@ def test_fused_moe_lora_expand():
     cache = torch.zeros(num_slices, M, tk, r, dtype=torch.float32, device=device)
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
-        cache, hidden, [lora_a], topk_weights, expert_ids,
+        cache, hidden, [lora_a], topk_weights,
+        None,
+        expert_ids,
         None,  # num_tokens_post_padded
         token_lora_mapping, tk, lora_ids, adapter_enabled,
         device,
@@ -742,7 +750,9 @@ def test_fused_moe_lora_expand():
     cache2 = torch.zeros(num_slices2, M2, tk2, r2, dtype=torch.float32, device=device)
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
-        cache2, hidden2, [lora_a2], topk_weights2, expert_ids2,
+        cache2, hidden2, [lora_a2], topk_weights2,
+        None,
+        expert_ids2,
         None,  # num_tokens_post_padded
         token_lora_mapping2, tk2, lora_ids2, adapter_enabled2,
         device,
@@ -815,10 +825,13 @@ def test_fused_moe_lora():
 
     _LORA_PTR_DICT.clear()
     _fused_moe_lora(
-        output, hidden, [lora_a], [lora_b], topk_weights, expert_ids,
+        output, hidden, [lora_a], [lora_b], topk_weights,
+        None,
+        expert_ids,
+        None,
         token_lora_mapping, r, tk, lora_ids, num_active_loras, adapter_enabled,
-        16, 16, 64, 1, 4, 3,    # shrink block m/n/k, group, warps, stages
-        16, 16, 16, 1, 4, 3,    # expand block m/n/k, group, warps, stages
+        16, 16, 64, 1, 4, 3, 1,   # shrink block m/n/k, group, warps, stages
+        16, 16, 16, 1, 4, 3, 1,   # expand block m/n/k, group, warps, stages
         mul_routed_weight=False,
         fully_sharded=False,
         offset=0,
@@ -902,3 +915,4 @@ if __name__ == "__main__":
     test_fused_moe_lora_shrink()
     test_fused_moe_lora_expand()
     test_fused_moe_lora()
+
