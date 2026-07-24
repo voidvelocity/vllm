@@ -196,6 +196,7 @@ def _fused_moe_lora_shrink(
     lora_a_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
     expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None, # UnusedVar
     token_lora_mapping: torch.Tensor,
     top_k_num: int,
     lora_ids: torch.Tensor,
@@ -214,8 +215,11 @@ def _fused_moe_lora_shrink(
     group_size_m: int,
     num_warps: int,
     num_stages: int,
+    split_k: int, # UnusedVar
     num_active_loras: torch.Tensor,
     mul_routed_weight: bool = False,
+    use_gdc: bool = False,
+    use_tma: bool = False,
 ) -> None:
     """Shrink step: x @ lora_a^T -> intermediate cache."""
     w1_lora_a_stacked = lora_a_stacked[0]
@@ -273,7 +277,9 @@ def _fused_moe_lora_expand(
     a_intermediate_cache1: torch.Tensor,
     lora_b_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None, # UnusedVar
     expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,  # UnusedVar
     token_lora_mapping: torch.Tensor,
     top_k_num: int,
     lora_ids: torch.Tensor,
@@ -294,9 +300,12 @@ def _fused_moe_lora_expand(
     group_size_m: int,
     num_warps: int,
     num_stages: int,
+    split_k: int,
     num_active_loras: torch.Tensor,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    use_gdc: bool = False,
+    use_tma: bool = False,
 ) -> None:
     """Expand step: intermediate cache @ lora_b^T -> output."""
     b_ptr = _get_ptr(lora_b_stacked, device)
@@ -363,7 +372,9 @@ def _fused_moe_lora(
     lora_a_stacked: list[torch.Tensor],
     lora_b_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
     token_lora_mapping: torch.Tensor,
     max_lora_rank: int,
     top_k_num: int,
@@ -376,12 +387,14 @@ def _fused_moe_lora(
     shrink_group_size_m: int,
     shrink_num_warps: int,
     shrink_num_stages: int,
+    shrink_split_k: int,
     expand_block_size_m: int,
     expand_block_size_n: int,
     expand_block_size_k: int,
     expand_group_size_m: int,
     expand_num_warps: int,
     expand_num_stages: int,
+    expand_split_k: int,
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
@@ -433,6 +446,7 @@ def _fused_moe_lora(
         lora_a_stacked,
         topk_weights,
         expert_ids,
+        None,  # num_tokens_post_padded
         token_lora_mapping,
         top_k_num,
         lora_ids,
@@ -451,8 +465,11 @@ def _fused_moe_lora(
         shrink_group_size_m,
         shrink_num_warps,
         shrink_num_stages,
+        shrink_split_k,
         num_active_loras,
         mul_routed_weight,
+        False,
+        False,
     )
 
     if fully_sharded:
@@ -471,7 +488,9 @@ def _fused_moe_lora(
         a_intermediate_cache1,
         lora_b_stacked,
         topk_weights,
+        None,  # sorted_token_ids
         expert_ids,
+        None,  # num_tokens_post_padded
         token_lora_mapping,
         top_k_num,
         lora_ids,
@@ -492,9 +511,12 @@ def _fused_moe_lora(
         expand_group_size_m,
         expand_num_warps,
         expand_num_stages,
+        expand_split_k,
         num_active_loras,
         mul_routed_weight,
         offset,
+        False,
+        False,
     )
 
 
@@ -559,10 +581,12 @@ def test_fused_moe_lora_shrink():
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
         cache, hidden, [lora_a], topk_weights, expert_ids,
+        None,  # num_tokens_post_padded
         token_lora_mapping, tk, lora_ids, adapter_enabled,
         device,
         N, M, EM, K, EM, num_experts, num_slices,
-        16, 16, 64, 1, 4, 3, num_active_loras, False,
+        16, 16, 64, 1, 4, 3, 1, num_active_loras, False,
+        False, False,
     )
 
     ref = torch.zeros(num_slices, M, tk, N, dtype=torch.float32)
@@ -602,10 +626,12 @@ def test_fused_moe_lora_shrink():
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
         cache2, hidden2, [lora_a2], topk_weights2, expert_ids2,
+        None,  # num_tokens_post_padded
         token_lora_mapping2, tk2, lora_ids2, adapter_enabled2,
         device,
         N2, M2, EM2, K2, EM2, num_experts2, num_slices2,
-        16, 16, 64, 1, 4, 3, num_active_loras2, False,
+        16, 16, 64, 1, 4, 3, 1, num_active_loras2, False,
+        False, False,
     )
 
     ref2 = torch.zeros(num_slices2, M2, tk2, N2, dtype=torch.float32)
@@ -651,10 +677,12 @@ def test_fused_moe_lora_expand():
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
         cache, hidden, [lora_a], topk_weights, expert_ids,
+        None,  # num_tokens_post_padded
         token_lora_mapping, tk, lora_ids, adapter_enabled,
         device,
         r, M, EM, K, EM, num_experts, num_slices,
-        16, 16, 64, 1, 4, 3, num_active_loras, False,
+        16, 16, 64, 1, 4, 3, 1, num_active_loras, False,
+        False, False,
     )
 
     # Step 2: run expand with ADD_INPUTS=True onto a non-zero output
@@ -663,12 +691,16 @@ def test_fused_moe_lora_expand():
 
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_expand(
-        output, cache, [lora_b], topk_weights, expert_ids,
+        output, cache, [lora_b], topk_weights,
+        None,  # sorted_token_ids
+        expert_ids,
+        None,  # num_tokens_post_padded
         token_lora_mapping, tk, lora_ids, adapter_enabled,
         device,
         w1_out, M, EM, r, EM, num_experts, num_slices,
         r, w1_out,
-        16, 16, 16, 1, 4, 3, num_active_loras, False, 0,
+        16, 16, 16, 1, 4, 3, 1, num_active_loras, False, 0,
+        False, False,
     )
 
     # Reference: out[i,x] += cache[0,i,x] @ lora_b[0,0].T
@@ -711,10 +743,12 @@ def test_fused_moe_lora_expand():
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_shrink(
         cache2, hidden2, [lora_a2], topk_weights2, expert_ids2,
+        None,  # num_tokens_post_padded
         token_lora_mapping2, tk2, lora_ids2, adapter_enabled2,
         device,
         r2, M2, EM2, K2, EM2, num_experts2, num_slices2,
-        16, 16, 64, 1, 4, 3, num_active_loras2, False,
+        16, 16, 64, 1, 4, 3, 1, num_active_loras2, False,
+        False, False,
     )
 
     output2 = torch.randn(
@@ -724,12 +758,16 @@ def test_fused_moe_lora_expand():
 
     _LORA_PTR_DICT.clear()
     _fused_moe_lora_expand(
-        output2, cache2, [lora_b2], topk_weights2, expert_ids2,
+        output2, cache2, [lora_b2], topk_weights2,
+        None,  # sorted_token_ids
+        expert_ids2,
+        None,  # num_tokens_post_padded
         token_lora_mapping2, tk2, lora_ids2, adapter_enabled2,
         device,
         w1_out2, M2, EM2, r2, EM2, num_experts2, num_slices2,
         r2, w1_out2,
-        16, 16, 16, 1, 4, 3, num_active_loras2, True, 0,
+        16, 16, 16, 1, 4, 3, 1, num_active_loras2, True, 0,
+        False, False,
     )
 
     # Reference: out[i,0] += (cache[0,i,0] @ lora_b[0,eid].T) * topk_w[i,0]
@@ -830,10 +868,13 @@ def test_fused_moe_lora():
 
     _LORA_PTR_DICT.clear()
     _fused_moe_lora(
-        output2, hidden2, [lora_a2], [lora_b2], topk_weights2, expert_ids2,
+        output2, hidden2, [lora_a2], [lora_b2], topk_weights2,
+        None,  # sorted_token_ids
+        expert_ids2,
+        None,  # num_tokens_post_padded
         token_lora_mapping2, r2, tk2, lora_ids2, num_active_loras2, adapter_enabled2,
-        16, 16, 64, 1, 4, 3,
-        16, 16, 16, 1, 4, 3,
+        16, 16, 64, 1, 4, 3, 1,
+        16, 16, 16, 1, 4, 3, 1,
         mul_routed_weight=True,
         fully_sharded=False,
         offset=0,
